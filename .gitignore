@@ -1,0 +1,29 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# PyQt / UI cache
+*.pyc
+*.pyd
+
+# Dati di test e scansioni temporanee pesanti (opzionale)
+*.csv.bak
+output_exports/*.dxf
+output_exports/*.csv
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
