@@ -68,7 +68,7 @@ class ICPEngine2D(BaseRegistrationEngine):
     def _smooth_slice_seams(self, points: np.ndarray, seam_x_coords: list, seam_radius: float = 0.08) -> np.ndarray:
         """
         Saldatura delle giunzioni: identifica i punti in prossimità dei confini di taglio
-        e ne raccorda le coordinate per eliminare gradini residui e piccoli gap.
+        e ne raccorda le coordinate per eliminare gradini residui e micro-gap.
         """
         if len(points) == 0 or not seam_x_coords:
             return points
@@ -88,16 +88,15 @@ class ICPEngine2D(BaseRegistrationEngine):
 
     def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.02) -> np.ndarray:
         """
-        RITAGLIO RIGIDO A RETTANGOLI DI COMPETENZA CON SALDATURA DEI CONFINI:
-        - Divide la mappa lungo l'asse X in N rettangoli esclusivi.
-        - Mantiene esclusivamente la stazione associata in ogni fascia.
-        - Raccorda le giunzioni sui confini per rimuovere dislivelli e gradini.
-        - Uniforma il passo con un campionamento voxel finale.
+        RITAGLIO ADATTIVO CON CONFINI A PUNTO MEDIO (MIDPOINT / VORONOI 1D):
+        - Calcola i confini di taglio esattamente a metà strada tra stazioni adiacenti.
+        - Assegna ciascuna fascia spaziale alla stazione fisicamente più vicina.
+        - Funziona con posizionamenti regolari, asimmetrici o arbitrari.
         """
         if not tagged_points:
             return np.empty((0, 2), dtype=np.float32)
 
-        valid_stations = [(pts[:, :2], center[:2]) for pts, center in tagged_points if len(pts) > 0]
+        valid_stations = [(pts[:, :2], np.array(center[:2], dtype=np.float32)) for pts, center in tagged_points if len(pts) > 0]
         num_stations = len(valid_stations)
         if num_stations == 0:
             return np.empty((0, 2), dtype=np.float32)
@@ -105,31 +104,40 @@ class ICPEngine2D(BaseRegistrationEngine):
         if num_stations == 1:
             return valid_stations[0][0]
 
-        # 1. Bounding Box globale lungo l'asse X
+        # 1. Bounding Box globale lungo X
         all_pts_flat = np.vstack([pts for pts, _ in valid_stations])
         x_min_glob = float(np.min(all_pts_flat[:, 0]))
         x_max_glob = float(np.max(all_pts_flat[:, 0]))
-        width = x_max_glob - x_min_glob
-        slice_width = width / float(num_stations)
 
-        # 2. Ordinamento delle stazioni lungo X
+        # 2. Ordinamento stazioni da sinistra a destra lungo l'asse X
         station_centers_x = [center[0] for _, center in valid_stations]
-        sorted_station_indices = np.argsort(station_centers_x)
+        sorted_indices = np.argsort(station_centers_x)
+        sorted_centers_x = [station_centers_x[i] for i in sorted_indices]
+
+        # 3. Calcolo dinamico dei punti medi (confini di separazione)
+        midpoints = []
+        for i in range(num_stations - 1):
+            mid = (sorted_centers_x[i] + sorted_centers_x[i + 1]) / 2.0
+            midpoints.append(mid)
 
         sliced_clouds = []
-        seam_coords = []
+        seam_coords = list(midpoints)
 
-        # 3. Ritaglio per fette con calcolo delle coordinate di giunzione
-        for sector_idx, st_idx in enumerate(sorted_station_indices):
+        # 4. Ritaglio per fasce di competenza dinamiche
+        for sector_idx, st_idx in enumerate(sorted_indices):
             pts, _ = valid_stations[st_idx]
 
-            x_start = x_min_glob + sector_idx * slice_width
-            x_end = x_min_glob + (sector_idx + 1) * slice_width
+            if sector_idx == 0:
+                x_start = x_min_glob - 0.5
+                x_end = midpoints[0]
+            elif sector_idx == num_stations - 1:
+                x_start = midpoints[-1]
+                x_end = x_max_glob + 0.5
+            else:
+                x_start = midpoints[sector_idx - 1]
+                x_end = midpoints[sector_idx]
 
-            if sector_idx > 0:
-                seam_coords.append(x_start)
-
-            # Margine di overlap sul confine per evitare gap di discontinuità
+            # Margine di overlap di 2 cm sul confine per prevenire discontinuità
             mask = (pts[:, 0] >= x_start - 0.02) & (pts[:, 0] <= x_end + 0.02)
 
             isolated_slice = pts[mask]
@@ -141,10 +149,10 @@ class ICPEngine2D(BaseRegistrationEngine):
 
         stitched_perimeter = np.vstack(sliced_clouds)
 
-        # 4. Saldatura dei confini sui tagli
+        # 5. Micro-Snap sui confini a punto medio
         welded_perimeter = self._smooth_slice_seams(stitched_perimeter, seam_coords, seam_radius=0.08)
 
-        # 5. Voxel Grid a passo uniforme
+        # 6. Voxel Grid Filter uniforme
         grid_indices = np.floor(welded_perimeter / voxel_size).astype(np.int32)
         x_min, y_min = grid_indices.min(axis=0)
         x_span = grid_indices[:, 0] - x_min

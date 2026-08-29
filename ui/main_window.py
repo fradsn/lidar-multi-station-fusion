@@ -312,12 +312,13 @@ class MainWindow(QMainWindow):
         if not self.layers:
             return np.empty((0, 3 if self.is_3d_mode else 2))
 
-        # Raggruppa i punti trasformati associandoli alla posizione reale del rispettivo LiDAR
+        # Associa i punti trasformati alla posizione reale (X, Y) del sensore nel sistema globale
         tagged_stations = []
         for l in self.layers:
             pts = l.get_transformed_points(self.current_engine)
             if len(pts) > 0:
-                tagged_stations.append((pts, l.sensor_center_2d))
+                sensor_pos = np.array([l.tx, l.ty], dtype=np.float32)
+                tagged_stations.append((pts, sensor_pos))
 
         if not tagged_stations:
             return np.empty((0, 2))
