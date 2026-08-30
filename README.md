@@ -32,12 +32,10 @@ Comparison showing the removal of parallel ghost walls through Hard Bounding-Box
 
 Full 3D volumetric workflow with 6-DoF cascade registration, horizon-aware 3-band vertical authority partitioning, and OpenGL interactive rendering.
 
-<div align="center">
-  <video src="docs/images/3dFusion.mp4" width="100%" controls autoplay loop muted>
-    Your browser does not support the video tag. You can view the demo video directly at <code>docs/images/3dFusion.mp4</code>.
-  </video>
-  <p><em>Demo: 3D multi-station cascade alignment, 3-band horizon fusion, and real-time point size rendering.</em></p>
-</div>
+
+https://github.com/user-attachments/assets/a9956a8a-90a6-4aec-bc18-8eb90867c8ef
+
+
 
 ---
 
