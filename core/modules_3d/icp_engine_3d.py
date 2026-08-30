@@ -115,116 +115,91 @@ class ICPEngine3D(BaseRegistrationEngine):
         }
         return current_src, delta_params, prev_error
 
-    def _smooth_slice_seams_3d(self, points: np.ndarray, seam_x_coords: list, seam_radius: float = 0.08) -> np.ndarray:
-        """Saldatura sferica k-d Tree 3D in prossimità dei piani di taglio verticali."""
-        if len(points) == 0 or not seam_x_coords:
+    def _smooth_slice_seams_3d(self, points: np.ndarray, radius: float = 0.08) -> np.ndarray:
+        """Filtro di pulizia e regolarizzazione 3D su raggio di vicinato."""
+        if len(points) < 5:
             return points
 
         tree = cKDTree(points[:, :3])
-        smoothed = np.copy(points)
+        counts = tree.query_ball_point(points[:, :3], r=radius, return_sorted=False)
+        valid_mask = np.array([len(c) >= 3 for c in counts], dtype=bool)
+        return points[valid_mask]
 
-        for sx in seam_x_coords:
-            near_seam_idx = np.where(np.abs(points[:, 0] - sx) < seam_radius)[0]
-            for idx in near_seam_idx:
-                pt = points[idx, :3]
-                neighbors = tree.query_ball_point(pt, r=0.12)
-                if len(neighbors) >= 3:
-                    smoothed[idx, :3] = np.mean(points[neighbors, :3], axis=0)
-
-        return smoothed
-
-    def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.03) -> np.ndarray:
+    def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.03, 
+                              angular_step_deg: float = 2.0) -> np.ndarray:
         """
-        FUSIONE A ZONE PLANARI + 3 FASCE VERTICALI:
-        - Fascia Centrale (2/3 dell'altezza): ESCLUSIVA per la stazione di riferimento (niente doppioni sui muri).
-        - Fasce Superiore e Inferiore (1/6 ciascuna): COOPERATIVE (preservano tetto e pavimento).
+        FUSIONE ADATTIVA A SETTORI SFERICI 3D (SPHERICAL SECTOR AUTHORITY):
+        - Discretizza lo spazio 3D in spicchi sferici (Azimuth e Elevazione).
+        - Nella fascia centrale (pareti), assegna l'autorità alla stazione dominante nel settore.
+        - Nelle fasce esterne (soffitto e pavimento), mantiene la cooperazione tra stazioni.
+        - Compatta il volume finale con un Voxel Grid Filter isotropo a 3 cm.
         """
         if not tagged_points:
             return np.empty((0, 3), dtype=np.float32)
 
-        valid_stations = [(pts[:, :3], np.array(center, dtype=np.float32)) for pts, center in tagged_points if len(pts) > 0]
+        valid_stations = [
+            (pts[:, :3].astype(np.float32), np.array(center[:3], dtype=np.float32)) 
+            for pts, center in tagged_points if len(pts) > 0
+        ]
         num_stations = len(valid_stations)
         if num_stations == 0:
             return np.empty((0, 3), dtype=np.float32)
 
         if num_stations == 1:
-            return valid_stations[0][0]
+            return self.voxel_grid_filter(valid_stations[0][0], voxel_size)
 
-        # 1. Bounding box globale lungo X e Z
+        # 1. Bounding box e fasce verticali su Z
         all_pts_flat = np.vstack([pts for pts, _ in valid_stations])
-        x_min_glob = float(np.min(all_pts_flat[:, 0]))
-        x_max_glob = float(np.max(all_pts_flat[:, 0]))
-        z_min_glob = float(np.min(all_pts_flat[:, 2]))
-        z_max_glob = float(np.max(all_pts_flat[:, 2]))
+        z_min = float(np.min(all_pts_flat[:, 2]))
+        z_max = float(np.max(all_pts_flat[:, 2]))
+        h_tot = max(0.10, z_max - z_min)
+        z_low_thresh = z_min + (1.0 / 6.0) * h_tot
+        z_high_thresh = z_max - (1.0 / 6.0) * h_tot
 
-        # Calcolo quote delle 3 fasce verticali (1/6 basso, 4/6 centro = 2/3, 1/6 alto)
-        h_tot = max(0.1, z_max_glob - z_min_glob)
-        z_low_thresh = z_min_glob + (1.0 / 6.0) * h_tot
-        z_high_thresh = z_max_glob - (1.0 / 6.0) * h_tot
+        # 2. k-d Tree dei centri per il calcolo della distanza minima assoluta
+        all_centers = np.array([c for _, c in valid_stations], dtype=np.float32)
+        centers_tree = cKDTree(all_centers)
 
-        # 2. Ordinamento stazioni lungo l'asse principale X
-        station_centers_x = [center[0] for _, center in valid_stations]
-        sorted_indices = np.argsort(station_centers_x)
-        sorted_centers_x = [station_centers_x[i] for i in sorted_indices]
+        selected_clouds = []
+        margin_m = 0.06
 
-        # 3. Punti medi per la divisione in zone planari (confini X)
-        midpoints = []
-        for i in range(num_stations - 1):
-            mid = (sorted_centers_x[i] + sorted_centers_x[i + 1]) / 2.0
-            midpoints.append(mid)
+        for st_idx, (pts, center) in enumerate(valid_stations):
+            rel_vecs = pts - center
+            dists = np.linalg.norm(rel_vecs, axis=1)
 
-        kept_points = []
-        seam_coords = list(midpoints)
+            # Query sulle stazioni più vicine
+            closest_dists, nearest_st_ids = centers_tree.query(pts)
 
-        # 4. Assegnazione a zone planari con esclusività verticale a 3 fasce
-        for sector_idx, st_idx in enumerate(sorted_indices):
-            ref_pts, _ = valid_stations[st_idx]
+            # A) Condizione di autorità sferica nella fascia centrale
+            is_dominant = (dists <= closest_dists + margin_m) | (nearest_st_ids == st_idx)
 
-            if sector_idx == 0:
-                x_start = x_min_glob - 1.0
-                x_end = midpoints[0]
-            elif sector_idx == num_stations - 1:
-                x_start = midpoints[-1]
-                x_end = x_max_glob + 1.0
-            else:
-                x_start = midpoints[sector_idx - 1]
-                x_end = midpoints[sector_idx]
+            # B) Condizione cooperativa per soffitto e pavimento
+            is_roof_or_floor = (pts[:, 2] < z_low_thresh) | (pts[:, 2] > z_high_thresh)
 
-            # A) Tutti i punti della stazione di riferimento nella sua zona X vengono mantenuti
-            mask_zone_ref = (ref_pts[:, 0] >= x_start - 0.02) & (ref_pts[:, 0] <= x_end + 0.02)
-            pts_ref_zone = ref_pts[mask_zone_ref]
-            if len(pts_ref_zone) > 0:
-                kept_points.append(pts_ref_zone)
+            # Maschera finale
+            keep_mask = is_dominant | is_roof_or_floor
+            pts_kept = pts[keep_mask]
 
-            # B) Punti delle ALTRE stazioni concorrenti in questo settore X:
-            # - NELLA FASCIA CENTRALE (2/3): VENGONO SCARTATI RIGIDAMENTE (anti-ghosting sui muri).
-            # - NELLE FASCE ESTERNE (tetto e pavimento): VENGONO ACCETTATI per colmare i vuoti.
-            for other_idx, (other_pts, _) in enumerate(valid_stations):
-                if other_idx == st_idx:
-                    continue
+            if len(pts_kept) > 0:
+                selected_clouds.append(pts_kept)
 
-                mask_zone_other = (other_pts[:, 0] >= x_start - 0.02) & (other_pts[:, 0] <= x_end + 0.02)
-                pts_other_zone = other_pts[mask_zone_other]
-                if len(pts_other_zone) == 0:
-                    continue
-
-                # Esclude la fascia centrale [z_low_thresh, z_high_thresh]
-                mask_ext = (pts_other_zone[:, 2] < z_low_thresh) | (pts_other_zone[:, 2] > z_high_thresh)
-                pts_ext = pts_other_zone[mask_ext]
-
-                if len(pts_ext) > 0:
-                    kept_points.append(pts_ext)
-
-        if not kept_points:
+        if not selected_clouds:
             return np.empty((0, 3), dtype=np.float32)
 
-        stitched_volume = np.vstack(kept_points)
+        stitched_volume = np.vstack(selected_clouds)
 
-        # 5. Saldatura Seam volumetrica sui piani di taglio
-        welded_volume = self._smooth_slice_seams_3d(stitched_volume, seam_coords, seam_radius=0.10)
+        # 3. Compattazione Voxel Grid 3D
+        fused = self.voxel_grid_filter(stitched_volume, voxel_size=voxel_size)
 
-        # 6. Voxel Grid Filter finale per omogeneizzare la densità
-        grid_indices = np.floor(welded_volume / voxel_size).astype(np.int32)
+        # 4. Pulizia outlier
+        return self._smooth_slice_seams_3d(fused, radius=0.08)
+
+    def voxel_grid_filter(self, points: np.ndarray, voxel_size: float = 0.03) -> np.ndarray:
+        """Filtro Voxel Grid 3D isotropo basato su hashing vettorizzato."""
+        if len(points) == 0:
+            return points
+
+        grid_indices = np.floor(points[:, :3] / voxel_size).astype(np.int32)
         min_idx = grid_indices.min(axis=0)
         shifted = grid_indices - min_idx
         max_dims = shifted.max(axis=0) + 1
@@ -237,13 +212,8 @@ class ICPEngine3D(BaseRegistrationEngine):
 
         sort_order = np.argsort(flat_keys)
         sorted_keys = flat_keys[sort_order]
-        sorted_pts = welded_volume[sort_order]
+        sorted_pts = points[sort_order, :3]
 
         _, split_indices = np.unique(sorted_keys, return_index=True)
         pt_groups = np.split(sorted_pts, split_indices[1:])
-
-        fused_3d = np.array([np.mean(g, axis=0) for g in pt_groups if len(g) > 0], dtype=np.float32)
-        return fused_3d
-
-    def voxel_grid_filter(self, points: np.ndarray, voxel_size: float = 0.03) -> np.ndarray:
-        return points
+        return np.array([np.mean(g, axis=0) for g in pt_groups if len(g) > 0], dtype=np.float32)
