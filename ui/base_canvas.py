@@ -6,19 +6,23 @@ class BaseStitchCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.point_size = 3.5
 
     def update_layer_view(self, layer_idx: int, points: np.ndarray):
-        """Aggiorna o crea il rendering per una specifica stazione."""
+        raise NotImplementedError
+
+    def show_merged_preview(self, points: np.ndarray, visible: bool):
+        raise NotImplementedError
+
+    def set_point_size(self, size: float):
+        """Aggiorna dinamicamente la dimensione di rendering dei punti."""
         raise NotImplementedError
 
     def remove_layer(self, layer_idx: int):
-        """Rimuove un layer dal canvas."""
         raise NotImplementedError
 
     def clear_all(self):
-        """Pulisce tutti i punti e reimposta la vista."""
         raise NotImplementedError
 
     def reset_camera(self):
-        """Reimposta l'inquadratura iniziale."""
         raise NotImplementedError

@@ -21,9 +21,8 @@ class Canvas2D(BaseStitchCanvas):
         layout.addWidget(self.plot_widget)
         self.scatter_items = {}
 
-        # Scatter plot dedicato per la mappa unificata fusa (Bianco/Ciano brillante)
         self.merged_scatter = pg.ScatterPlotItem(
-            size=3.5,
+            size=self.point_size,
             pen=pg.mkPen(None),
             brush=pg.mkBrush('#00ffff'),
             symbol='o'
@@ -32,12 +31,18 @@ class Canvas2D(BaseStitchCanvas):
         self.plot_widget.addItem(self.merged_scatter)
         self.merged_scatter.hide()
 
+    def set_point_size(self, size: float):
+        self.point_size = float(size)
+        for scatter in self.scatter_items.values():
+            scatter.setSize(self.point_size)
+        self.merged_scatter.setSize(self.point_size)
+
     def update_layer_view(self, layer_idx: int, points: np.ndarray):
         color_hex = LAYER_COLORS[layer_idx % len(LAYER_COLORS)]
 
         if layer_idx not in self.scatter_items:
             scatter = pg.ScatterPlotItem(
-                size=4,
+                size=self.point_size,
                 pen=pg.mkPen(None),
                 brush=pg.mkBrush(color_hex),
                 symbol='o'
@@ -46,17 +51,15 @@ class Canvas2D(BaseStitchCanvas):
             self.scatter_items[layer_idx] = scatter
 
         if len(points) > 0:
-            self.scatter_items[layer_idx].setData(pos=points[:, :2])
+            self.scatter_items[layer_idx].setData(pos=points[:, :2], size=self.point_size)
         else:
             self.scatter_items[layer_idx].setData(pos=np.empty((0, 2)))
 
     def show_merged_preview(self, points: np.ndarray, visible: bool):
-        """Attiva o disattiva la visualizzazione della mappa unificata finale."""
         if visible and len(points) > 0:
-            # Nasconde i singoli layer colorati
             for sc in self.scatter_items.values():
                 sc.hide()
-            self.merged_scatter.setData(pos=points[:, :2])
+            self.merged_scatter.setData(pos=points[:, :2], size=self.point_size)
             self.merged_scatter.show()
         else:
             self.merged_scatter.hide()

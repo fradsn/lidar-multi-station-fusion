@@ -4,7 +4,7 @@ import pandas as pd
 import pyqtgraph as pg
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
+    QMainWindow, QSlider, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QFileDialog, QListWidget, QLabel, QDoubleSpinBox, QGroupBox,
     QMessageBox, QListWidgetItem, QComboBox, QStackedWidget
 )
@@ -71,6 +71,20 @@ class MainWindow(QMainWindow):
         v_files.addWidget(btn_clear)
         side_panel.addWidget(gb_files)
 
+        # Nel _setup_ui, subito dopo o prima del selettore modalità:
+        gb_view = QGroupBox("🔍 Rendering & Visualizzazione")
+        v_view = QVBoxLayout(gb_view)
+        
+        self.lbl_pt_size = QLabel("Dimensione Punti: 3.5 px")
+        self.slider_pt_size = QSlider(Qt.Orientation.Horizontal)
+        self.slider_pt_size.setRange(1, 10)
+        self.slider_pt_size.setValue(4) # 3.5 - 4 px
+        self.slider_pt_size.valueChanged.connect(self._on_point_size_changed)
+        
+        v_view.addWidget(self.lbl_pt_size)
+        v_view.addWidget(self.slider_pt_size)
+        side_panel.addWidget(gb_view)
+
         # 3. Allineamento Automatico e Manuale
         gb_align = QGroupBox("⚡ Allineamento Scansioni")
         v_align = QVBoxLayout(gb_align)
@@ -136,7 +150,7 @@ class MainWindow(QMainWindow):
         # 5. Esportazione
         gb_export = QGroupBox("💾 Esporta Mappa Fusa")
         v_export = QVBoxLayout(gb_export)
-        btn_export_cad = QPushButton("📐 Esporta DXF (AutoCAD)")
+        btn_export_cad = QPushButton("📐 Esporta DXF/PLY (CAD/3D)")
         btn_export_cad.clicked.connect(self._export_cad)
         btn_export_table = QPushButton("📊 Esporta CSV Finale")
         btn_export_table.clicked.connect(self._export_table)
@@ -166,21 +180,25 @@ class MainWindow(QMainWindow):
         self._refresh_all_canvas()
 
     def _load_csv_dialog(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Carica Scansioni CSV", "", "File CSV (*.csv)")
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Carica Scansioni (2D o 3D)",
+            "",
+            "File Compatibili (*.csv *.xyz *.txt *.dat);;Tutti i file (*.*)"
+        )
+        if not paths:
+            return
+
         for p in paths:
             try:
-                df = pd.read_csv(p)
-                if 'X' in df.columns and 'Y' in df.columns:
-                    cols = ['X', 'Y', 'Z'] if ('Z' in df.columns and self.is_3d_mode) else ['X', 'Y']
-                    pts = df[cols].to_numpy(dtype=np.float32)
-                elif 'x' in df.columns and 'y' in df.columns:
-                    cols = ['x', 'y', 'z'] if ('z' in df.columns and self.is_3d_mode) else ['x', 'y']
-                    pts = df[cols].to_numpy(dtype=np.float32)
-                else:
-                    pts = df.iloc[:, : (3 if self.is_3d_mode else 2)].to_numpy(dtype=np.float32)
+                pts = self._parse_point_file(p, is_3d=self.is_3d_mode)
+                if len(pts) == 0:
+                    QMessageBox.warning(self, "Attenzione", f"Nessun punto valido trovato in:\n{p}")
+                    continue
 
                 idx = len(self.layers)
-                layer = ScanStationLayer(idx, f"Stazione {idx + 1}: {os.path.basename(p)}", p, pts, self.is_3d_mode)
+                layer_name = f"Stazione {idx + 1}: {os.path.basename(p)}"
+                layer = ScanStationLayer(idx, layer_name, p, pts, self.is_3d_mode)
                 self.layers.append(layer)
 
                 item = QListWidgetItem(f"● {layer.name}")
@@ -188,11 +206,102 @@ class MainWindow(QMainWindow):
                 self.list_layers.addItem(item)
 
                 self._get_active_canvas().update_layer_view(idx, layer.get_transformed_points(self.current_engine))
+
             except Exception as e:
                 QMessageBox.warning(self, "Errore", f"Impossibile leggere {p}:\n{e}")
 
         if self.layers and self.list_layers.currentRow() < 0:
             self.list_layers.setCurrentRow(0)
+
+    def _parse_point_file(self, file_path: str, is_3d: bool) -> np.ndarray:
+        """
+        Parser Universale per nuvole 2D e 3D:
+        - Determina in automatico la presenza di intestazioni o dati raw.
+        - Supporta delimitatori a virgola, spazi, tab o punto e virgola.
+        - Gestisce nomi colonna X_m, Y_m, X, Y, Z, Angle_deg, Distance_cm.
+        - Normalizza la scala in metri se i dati sono espressi in centimetri.
+        """
+        first_line = ""
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                l_str = line.strip()
+                if l_str and not l_str.startswith('#'):
+                    first_line = l_str
+                    break
+
+        tokens = first_line.replace(',', ' ').replace(';', ' ').split()
+        is_numeric_header = False
+        try:
+            [float(t) for t in tokens]
+            is_numeric_header = True
+        except ValueError:
+            is_numeric_header = False
+
+        header_opt = None if is_numeric_header else 'infer'
+
+        try:
+            df = pd.read_csv(file_path, sep=None, engine='python', header=header_opt, comment='#')
+        except Exception:
+            df = pd.read_csv(file_path, sep=r'\s+', engine='python', header=header_opt, comment='#')
+
+        req_dim = 3 if is_3d else 2
+
+        # 1. File con Header Testuale
+        if not is_numeric_header:
+            col_map = {str(c).strip().upper(): c for c in df.columns}
+            
+            x_col = next((col_map[k] for k in ['X', 'X_M', 'X_CM', 'X(M)', 'X(CM)'] if k in col_map), None)
+            y_col = next((col_map[k] for k in ['Y', 'Y_M', 'Y_CM', 'Y(M)', 'Y(CM)'] if k in col_map), None)
+            z_col = next((col_map[k] for k in ['Z', 'Z_M', 'Z_CM', 'Z(M)', 'Z(CM)'] if k in col_map), None)
+
+            if x_col is not None and y_col is not None:
+                x_vals = df[x_col].to_numpy(dtype=np.float32)
+                y_vals = df[y_col].to_numpy(dtype=np.float32)
+
+                if 'CM' in str(x_col).upper():
+                    x_vals /= 100.0
+                    y_vals /= 100.0
+
+                if is_3d:
+                    if z_col is not None:
+                        z_vals = df[z_col].to_numpy(dtype=np.float32)
+                        if 'CM' in str(z_col).upper():
+                            z_vals /= 100.0
+                    else:
+                        z_vals = np.zeros_like(x_vals)
+                    pts = np.column_stack([x_vals, y_vals, z_vals])
+                else:
+                    pts = np.column_stack([x_vals, y_vals])
+                return pts
+
+            ang_col = next((col_map[k] for k in ['ANGLE', 'ANGLE_DEG', 'THETA'] if k in col_map), None)
+            dist_col = next((col_map[k] for k in ['DISTANCE', 'DISTANCE_CM', 'DIST', 'R'] if k in col_map), None)
+            if ang_col is not None and dist_col is not None:
+                angles = df[ang_col].to_numpy(dtype=np.float32)
+                distances = df[dist_col].to_numpy(dtype=np.float32)
+                rad = np.deg2rad(angles)
+                r_m = distances / 100.0 if np.max(distances) > 15.0 else distances
+                x = -r_m * np.sin(rad)
+                y = r_m * np.cos(rad)
+                if is_3d:
+                    return np.column_stack([x, y, np.zeros_like(x)])
+                return np.column_stack([x, y])
+
+        # 2. File numerico raw
+        numeric_df = df.select_dtypes(include=[np.number])
+        if numeric_df.shape[1] >= req_dim:
+            pts = numeric_df.iloc[:, :req_dim].to_numpy(dtype=np.float32)
+        elif numeric_df.shape[1] == 2 and is_3d:
+            pts_2d = numeric_df.iloc[:, :2].to_numpy(dtype=np.float32)
+            pts = np.hstack([pts_2d, np.zeros((len(pts_2d), 1), dtype=np.float32)])
+        else:
+            pts = np.empty((0, req_dim), dtype=np.float32)
+
+        # 3. Conversione centimetri -> metri se necessario
+        if len(pts) > 0 and np.max(np.abs(pts)) > 30.0:
+            pts = pts / 100.0
+
+        return pts
 
     def _on_layer_selected(self, row: int):
         if 0 <= row < len(self.layers):
@@ -230,7 +339,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Avviso", "Seleziona la Stazione 2 o successiva per allinearla.")
             return
 
-        # Target = unione di tutte le stazioni precedenti
         target_pts = np.vstack([self.layers[i].get_transformed_points(self.current_engine) for i in range(row)])
         active_layer = self.layers[row]
         current_pts = active_layer.get_transformed_points(self.current_engine)
@@ -276,7 +384,6 @@ class MainWindow(QMainWindow):
             layer.ty += delta_params.get('ty', 0.0)
             layer.rot_yaw_deg = (layer.rot_yaw_deg + delta_params.get('yaw', 0.0)) % 360.0
 
-            # Aggiorna il riferimento progressivo includendo la stazione appena allineata
             accumulated_target = np.vstack([accumulated_target, layer.get_transformed_points(self.current_engine)])
             self._get_active_canvas().update_layer_view(i, layer.get_transformed_points(self.current_engine))
 
@@ -285,63 +392,77 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Allineamento Completato", "Tutte le scansioni sono state allineate automaticamente sulla mappa base.")
 
     def _execute_fusion(self):
-        """Fonde fisicamente tutti i punti coincidenti nei loro centroidi medi."""
+        """Fonde fisicamente tutti i punti coincidenti e aggiorna l'anteprima del canvas corrente."""
         pts = self._get_merged_points()
         if len(pts) == 0:
             QMessageBox.warning(self, "Avviso", "Nessun punto da fondere.")
             return
 
         self.btn_preview_merged.setChecked(True)
-        if isinstance(self._get_active_canvas(), Canvas2D):
-            self.canvas_2d.show_merged_preview(pts, visible=True)
-            self.lbl_icp_status.setText(f"🔥 Mappa Fusa Generata: {len(pts)} punti totali")
-            QMessageBox.information(self, "Fusione Eseguita", 
-                f"I muri sovrapposti sono stati fusi nei rispettivi centroidi geometrici!\nTotale punti unificati: {len(pts)}")
+        active_canvas = self._get_active_canvas()
+        active_canvas.show_merged_preview(pts, visible=True)
+
+        self.lbl_icp_status.setText(f"🔥 Mappa Fusa Generata: {len(pts)} punti totali")
+        QMessageBox.information(
+            self,
+            "Fusione Eseguita",
+            f"Fusione geometrica completata!\nTotale punti unificati: {len(pts)}"
+        )
 
     def _toggle_merged_preview(self):
+        """Attiva o disattiva la visualizzazione della mappa fusa sul canvas attivo."""
         is_preview = self.btn_preview_merged.isChecked()
+        active_canvas = self._get_active_canvas()
+
         if is_preview:
             pts = self._get_merged_points()
-            if isinstance(self._get_active_canvas(), Canvas2D):
-                self.canvas_2d.show_merged_preview(pts, visible=True)
+            active_canvas.show_merged_preview(pts, visible=True)
         else:
-            if isinstance(self._get_active_canvas(), Canvas2D):
-                self.canvas_2d.show_merged_preview(np.empty((0, 2)), visible=False)
+            empty_pts = np.empty((0, 3 if self.is_3d_mode else 2), dtype=np.float32)
+            active_canvas.show_merged_preview(empty_pts, visible=False)
 
     def _get_merged_points(self) -> np.ndarray:
+        """Calcola la nuvola unificata delegando all'engine corretto (2D o 3D)."""
         if not self.layers:
-            return np.empty((0, 3 if self.is_3d_mode else 2))
+            return np.empty((0, 3 if self.is_3d_mode else 2), dtype=np.float32)
 
-        # Associa i punti trasformati alla posizione reale (X, Y) del sensore nel sistema globale
         tagged_stations = []
         for l in self.layers:
             pts = l.get_transformed_points(self.current_engine)
             if len(pts) > 0:
-                sensor_pos = np.array([l.tx, l.ty], dtype=np.float32)
+                if self.is_3d_mode:
+                    sensor_pos = np.array([l.tx, l.ty, getattr(l, 'tz', 0.0)], dtype=np.float32)
+                else:
+                    sensor_pos = np.array([l.tx, l.ty], dtype=np.float32)
                 tagged_stations.append((pts, sensor_pos))
 
         if not tagged_stations:
-            return np.empty((0, 2))
+            return np.empty((0, 3 if self.is_3d_mode else 2), dtype=np.float32)
 
         voxel_sz = DEFAULT_VOXEL_SIZE_3D if self.is_3d_mode else DEFAULT_VOXEL_SIZE_2D
-        return self.engine_2d.weighted_voxel_fusion(tagged_stations, voxel_size=voxel_sz)
+        return self.current_engine.weighted_voxel_fusion(tagged_stations, voxel_size=voxel_sz)
 
     def _export_cad(self):
         pts = self._get_merged_points()
         if len(pts) == 0:
             QMessageBox.warning(self, "Avviso", "Nessun punto da esportare.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Esporta DXF CAD", "pianta_fusa.dxf", "File DXF (*.dxf)")
+
+        ext = "*.ply" if self.is_3d_mode else "*.dxf"
+        filter_str = "File PLY 3D (*.ply)" if self.is_3d_mode else "File DXF (*.dxf)"
+        def_name = "modello_fuso_3d.ply" if self.is_3d_mode else "pianta_fusa.dxf"
+
+        path, _ = QFileDialog.getSaveFileName(self, "Esporta CAD / Mesh 3D", def_name, filter_str)
         if path:
             if self.current_exporter.export_cad(path, pts):
-                QMessageBox.information(self, "Completato", f"File CAD DXF esportato con {len(pts)} punti fusi!")
+                QMessageBox.information(self, "Completato", f"File salvato con successo ({len(pts)} punti fusi)!")
 
     def _export_table(self):
         pts = self._get_merged_points()
         if len(pts) == 0:
             QMessageBox.warning(self, "Avviso", "Nessun punto da esportare.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Esporta CSV", "pianta_fusa.csv", "File CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "Esporta CSV", "punti_fusi.csv", "File CSV (*.csv)")
         if path:
             if self.current_exporter.export_table(path, pts):
                 QMessageBox.information(self, "Completato", f"File CSV esportato con {len(pts)} punti fusi!")
@@ -362,3 +483,8 @@ class MainWindow(QMainWindow):
         self.canvas_3d.clear_all()
         self.btn_preview_merged.setChecked(False)
         self.lbl_icp_status.setText("Stato: Pronto")
+
+    def _on_point_size_changed(self, val: int):
+        self.lbl_pt_size.setText(f"Dimensione Punti: {val} px")
+        self.canvas_2d.set_point_size(val)
+        self.canvas_3d.set_point_size(val)
