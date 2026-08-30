@@ -20,6 +20,7 @@ from ui.base_canvas import BaseStitchCanvas
 from ui.canvas_2d import Canvas2D
 from ui.canvas_3d import Canvas3D
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -71,21 +72,21 @@ class MainWindow(QMainWindow):
         v_files.addWidget(btn_clear)
         side_panel.addWidget(gb_files)
 
-        # Nel _setup_ui, subito dopo o prima del selettore modalità:
+        # 3. Rendering & Visualizzazione
         gb_view = QGroupBox("🔍 Rendering & Visualizzazione")
         v_view = QVBoxLayout(gb_view)
         
-        self.lbl_pt_size = QLabel("Dimensione Punti: 3.5 px")
+        self.lbl_pt_size = QLabel("Dimensione Punti: 4 px")
         self.slider_pt_size = QSlider(Qt.Orientation.Horizontal)
         self.slider_pt_size.setRange(1, 10)
-        self.slider_pt_size.setValue(4) # 3.5 - 4 px
+        self.slider_pt_size.setValue(4)
         self.slider_pt_size.valueChanged.connect(self._on_point_size_changed)
         
         v_view.addWidget(self.lbl_pt_size)
         v_view.addWidget(self.slider_pt_size)
         side_panel.addWidget(gb_view)
 
-        # 3. Allineamento Automatico e Manuale
+        # 4. Allineamento Automatico e Manuale
         gb_align = QGroupBox("⚡ Allineamento Scansioni")
         v_align = QVBoxLayout(gb_align)
 
@@ -107,13 +108,13 @@ class MainWindow(QMainWindow):
         v_align.addWidget(QLabel("Offset Manuale X / Y / Yaw:"))
         h_gizmo = QHBoxLayout()
         self.spin_tx = QDoubleSpinBox()
-        self.spin_tx.setRange(-30.0, 30.0)
+        self.spin_tx.setRange(-50.0, 50.0)
         self.spin_tx.setSingleStep(0.05)
         self.spin_tx.setPrefix("X: ")
         self.spin_tx.valueChanged.connect(self._on_transform_changed)
 
         self.spin_ty = QDoubleSpinBox()
-        self.spin_ty.setRange(-30.0, 30.0)
+        self.spin_ty.setRange(-50.0, 50.0)
         self.spin_ty.setSingleStep(0.05)
         self.spin_ty.setPrefix("Y: ")
         self.spin_ty.valueChanged.connect(self._on_transform_changed)
@@ -131,7 +132,7 @@ class MainWindow(QMainWindow):
 
         side_panel.addWidget(gb_align)
 
-        # 4. Fusione Fisica e Generazione Master Map
+        # 5. Fusione Fisica e Generazione Master Map
         gb_fusion = QGroupBox("🔥 Generazione Mappa Fusa")
         v_fusion = QVBoxLayout(gb_fusion)
 
@@ -147,7 +148,7 @@ class MainWindow(QMainWindow):
 
         side_panel.addWidget(gb_fusion)
 
-        # 5. Esportazione
+        # 6. Esportazione
         gb_export = QGroupBox("💾 Esporta Mappa Fusa")
         v_export = QVBoxLayout(gb_export)
         btn_export_cad = QPushButton("📐 Esporta DXF/PLY (CAD/3D)")
@@ -216,9 +217,8 @@ class MainWindow(QMainWindow):
     def _parse_point_file(self, file_path: str, is_3d: bool) -> np.ndarray:
         """
         Parser Universale per nuvole 2D e 3D:
-        - Determina in automatico la presenza di intestazioni o dati raw.
+        - Supporta file con header testuali o raw numerici.
         - Supporta delimitatori a virgola, spazi, tab o punto e virgola.
-        - Gestisce nomi colonna X_m, Y_m, X, Y, Z, Angle_deg, Distance_cm.
         - Normalizza la scala in metri se i dati sono espressi in centimetri.
         """
         first_line = ""
@@ -297,7 +297,7 @@ class MainWindow(QMainWindow):
         else:
             pts = np.empty((0, req_dim), dtype=np.float32)
 
-        # 3. Conversione centimetri -> metri se necessario
+        # 3. Normalizzazione cm -> m
         if len(pts) > 0 and np.max(np.abs(pts)) > 30.0:
             pts = pts / 100.0
 
@@ -318,14 +318,14 @@ class MainWindow(QMainWindow):
             self.spin_ty.blockSignals(False)
             self.spin_yaw.blockSignals(False)
 
-            is_base = (row == 0)
-            self.spin_tx.setEnabled(not is_base)
-            self.spin_ty.setEnabled(not is_base)
-            self.spin_yaw.setEnabled(not is_base)
+            # Abilita sempre i controlli: permette di riallineare agli assi anche la Stazione 1 (Base)
+            self.spin_tx.setEnabled(True)
+            self.spin_ty.setEnabled(True)
+            self.spin_yaw.setEnabled(True)
 
     def _on_transform_changed(self):
         row = self.list_layers.currentRow()
-        if 0 <= row < len(self.layers) and row != 0:
+        if 0 <= row < len(self.layers):
             layer = self.layers[row]
             layer.tx = self.spin_tx.value()
             layer.ty = self.spin_ty.value()
@@ -430,6 +430,7 @@ class MainWindow(QMainWindow):
         for l in self.layers:
             pts = l.get_transformed_points(self.current_engine)
             if len(pts) > 0:
+                # Il centro del sensore corrisponde alle coordinate di traslazione globale (tx, ty, tz)
                 if self.is_3d_mode:
                     sensor_pos = np.array([l.tx, l.ty, getattr(l, 'tz', 0.0)], dtype=np.float32)
                 else:
