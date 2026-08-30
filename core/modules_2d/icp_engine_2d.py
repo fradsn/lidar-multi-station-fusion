@@ -65,95 +65,102 @@ class ICPEngine2D(BaseRegistrationEngine):
         delta_params = {'tx': accum_tx, 'ty': accum_ty, 'yaw': accum_yaw}
         return current_src, delta_params, prev_error
 
-    def _smooth_slice_seams(self, points: np.ndarray, seam_x_coords: list, seam_radius: float = 0.08) -> np.ndarray:
-        """
-        Saldatura delle giunzioni: identifica i punti in prossimità dei confini di taglio
-        e ne raccorda le coordinate per eliminare gradini residui e micro-gap.
-        """
-        if len(points) == 0 or not seam_x_coords:
+    def _smooth_slice_seams(self, points: np.ndarray, seam_x_coords: list = None, seam_radius: float = 0.08) -> np.ndarray:
+        """Filtro di regolarizzazione strutturale su raggio di vicinato per eliminare rumore isolato."""
+        if len(points) < 5:
             return points
 
         tree = cKDTree(points)
-        smoothed = np.copy(points)
+        counts = tree.query_ball_point(points, r=0.08, return_sorted=False)
+        valid_mask = np.array([len(c) >= 2 for c in counts], dtype=bool)
+        return points[valid_mask]
 
-        for sx in seam_x_coords:
-            near_seam_idx = np.where(np.abs(points[:, 0] - sx) < seam_radius)[0]
-            for idx in near_seam_idx:
-                pt = points[idx]
-                neighbors = tree.query_ball_point(pt, r=0.12)
-                if len(neighbors) >= 3:
-                    smoothed[idx] = np.mean(points[neighbors], axis=0)
-
-        return smoothed
-
-    def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.02) -> np.ndarray:
+    def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.02, 
+                              angular_step_deg: float = 1.0) -> np.ndarray:
         """
-        RITAGLIO ADATTIVO CON CONFINI A PUNTO MEDIO (MIDPOINT / VORONOI 1D):
-        - Calcola i confini di taglio esattamente a metà strada tra stazioni adiacenti.
-        - Assegna ciascuna fascia spaziale alla stazione fisicamente più vicina.
-        - Funziona con posizionamenti regolari, asimmetrici o arbitrari.
+        FUSIONE ADATTIVA A SPICCHI POLARI (POLAR SECTOR DENSITY AUTHORITY):
+        - Suddivide l'orizzonte di ciascuna stazione in spicchi polari da angular_step_deg gradi (es. 360 spicchi).
+        - In ogni spicchio polare, valuta la competizione locale tra stazioni: la stazione che ha
+          colpito la parete con la risoluzione angolare/densità migliore (minore distanza) ottiene l'autorità.
+        - Verso le direzioni libere (senza stazioni rivali), il raggio si espande senza limiti catturando tutto il muro.
+        - Unisce i settori e compatta la nuvola finale tramite Voxel Grid uniforme.
         """
         if not tagged_points:
             return np.empty((0, 2), dtype=np.float32)
 
-        valid_stations = [(pts[:, :2], np.array(center[:2], dtype=np.float32)) for pts, center in tagged_points if len(pts) > 0]
+        valid_stations = [
+            (pts[:, :2].astype(np.float32), np.array(center[:2], dtype=np.float32)) 
+            for pts, center in tagged_points if len(pts) > 0
+        ]
         num_stations = len(valid_stations)
         if num_stations == 0:
             return np.empty((0, 2), dtype=np.float32)
 
         if num_stations == 1:
-            return valid_stations[0][0]
+            return self.voxel_grid_filter(valid_stations[0][0], voxel_size)
 
-        # 1. Bounding Box globale lungo X
-        all_pts_flat = np.vstack([pts for pts, _ in valid_stations])
-        x_min_glob = float(np.min(all_pts_flat[:, 0]))
-        x_max_glob = float(np.max(all_pts_flat[:, 0]))
+        num_sectors = int(360.0 / angular_step_deg)
+        all_centers = np.array([c for _, c in valid_stations], dtype=np.float32)
+        centers_tree = cKDTree(all_centers)
 
-        # 2. Ordinamento stazioni da sinistra a destra lungo l'asse X
-        station_centers_x = [center[0] for _, center in valid_stations]
-        sorted_indices = np.argsort(station_centers_x)
-        sorted_centers_x = [station_centers_x[i] for i in sorted_indices]
+        selected_clouds = []
 
-        # 3. Calcolo dinamico dei punti medi (confini di separazione)
-        midpoints = []
-        for i in range(num_stations - 1):
-            mid = (sorted_centers_x[i] + sorted_centers_x[i + 1]) / 2.0
-            midpoints.append(mid)
+        # Analisi per ciascuna stazione
+        for st_idx, (pts, center) in enumerate(valid_stations):
+            # Calcolo coordinate polari locali (raggio d e angolo theta) rispetto al centro della stazione
+            rel_vecs = pts - center
+            dists = np.linalg.norm(rel_vecs, axis=1)
+            angles_rad = np.arctan2(rel_vecs[:, 1], rel_vecs[:, 0])
+            angles_deg = (np.rad2deg(angles_rad) + 360.0) % 360.0
 
-        sliced_clouds = []
-        seam_coords = list(midpoints)
+            # Discretizzazione nei canali angolari (spicchi)
+            sector_indices = np.floor(angles_deg / angular_step_deg).astype(np.int32) % num_sectors
 
-        # 4. Ritaglio per fasce di competenza dinamiche
-        for sector_idx, st_idx in enumerate(sorted_indices):
-            pts, _ = valid_stations[st_idx]
+            # Trova la distanza di ogni punto rispetto alla stazione più vicina in assoluto
+            closest_dists, nearest_st_ids = centers_tree.query(pts)
 
-            if sector_idx == 0:
-                x_start = x_min_glob - 0.5
-                x_end = midpoints[0]
-            elif sector_idx == num_stations - 1:
-                x_start = midpoints[-1]
-                x_end = x_max_glob + 0.5
-            else:
-                x_start = midpoints[sector_idx - 1]
-                x_end = midpoints[sector_idx]
+            # Maschera di autorità polare adattiva per ciascun punto
+            # Un punto viene trattenuto se:
+            # 1. La stazione corrente è la più vicina o entro un margine di tolleranza di 5 cm (massima risoluzione)
+            # 2. Nessun'altra stazione ha campionato lo stesso punto con distanza significativamente inferiore
+            margin_m = 0.05
+            is_dominant = (dists <= closest_dists + margin_m) | (nearest_st_ids == st_idx)
 
-            # Margine di overlap di 2 cm sul confine per prevenire discontinuità
-            mask = (pts[:, 0] >= x_start - 0.02) & (pts[:, 0] <= x_end + 0.02)
+            pts_dominant = pts[is_dominant]
+            sec_dominant = sector_indices[is_dominant]
+            dists_dominant = dists[is_dominant]
 
-            isolated_slice = pts[mask]
-            if len(isolated_slice) > 0:
-                sliced_clouds.append(isolated_slice)
+            if len(pts_dominant) == 0:
+                continue
 
-        if not sliced_clouds:
+            # Pulizia interna per spicchio: preserva i fronti d'onda della parete senza raddoppi interni
+            sort_sec = np.argsort(sec_dominant)
+            sorted_sec = sec_dominant[sort_sec]
+            sorted_pts = pts_dominant[sort_sec]
+
+            _, split_idx = np.unique(sorted_sec, return_index=True)
+            sec_groups = np.split(sorted_pts, split_idx[1:])
+
+            for group in sec_groups:
+                if len(group) > 0:
+                    selected_clouds.append(group)
+
+        if not selected_clouds:
             return np.empty((0, 2), dtype=np.float32)
 
-        stitched_perimeter = np.vstack(sliced_clouds)
+        stitched_perimeter = np.vstack(selected_clouds)
 
-        # 5. Micro-Snap sui confini a punto medio
-        welded_perimeter = self._smooth_slice_seams(stitched_perimeter, seam_coords, seam_radius=0.08)
+        # Compattazione finale con Voxel Grid Filter per uniformare il passo di campionamento
+        fused = self.voxel_grid_filter(stitched_perimeter, voxel_size=voxel_size)
 
-        # 6. Voxel Grid Filter uniforme
-        grid_indices = np.floor(welded_perimeter / voxel_size).astype(np.int32)
+        # Regolarizzazione sui bordi di contatto
+        return self._smooth_slice_seams(fused)
+
+    def voxel_grid_filter(self, points: np.ndarray, voxel_size: float = 0.02) -> np.ndarray:
+        """Filtro Voxel Grid isotropo 2D basato su hash grid."""
+        if len(points) == 0:
+            return points
+        grid_indices = np.floor(points[:, :2] / voxel_size).astype(np.int32)
         x_min, y_min = grid_indices.min(axis=0)
         x_span = grid_indices[:, 0] - x_min
         y_span = grid_indices[:, 1] - y_min
@@ -162,13 +169,8 @@ class ICPEngine2D(BaseRegistrationEngine):
 
         sort_order = np.argsort(flat_keys)
         sorted_keys = flat_keys[sort_order]
-        sorted_pts = welded_perimeter[sort_order]
+        sorted_pts = points[sort_order, :2]
 
         _, split_indices = np.unique(sorted_keys, return_index=True)
         pt_groups = np.split(sorted_pts, split_indices[1:])
-
-        fused = np.array([np.mean(g, axis=0) for g in pt_groups if len(g) > 0], dtype=np.float32)
-        return fused
-
-    def voxel_grid_filter(self, points: np.ndarray, voxel_size: float = 0.02) -> np.ndarray:
-        return points
+        return np.array([np.mean(g, axis=0) for g in pt_groups if len(g) > 0], dtype=np.float32)
