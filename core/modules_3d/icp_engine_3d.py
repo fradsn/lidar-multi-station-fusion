@@ -116,7 +116,7 @@ class ICPEngine3D(BaseRegistrationEngine):
         return current_src, delta_params, prev_error
 
     def _smooth_slice_seams_3d(self, points: np.ndarray, radius: float = 0.08) -> np.ndarray:
-        """Filtro di pulizia e regolarizzazione 3D su raggio di vicinato."""
+        """Filtro di pulizia e regolarizzazione 3D su raggio di vicinato per eliminare residui spuri."""
         if len(points) < 5:
             return points
 
@@ -125,14 +125,15 @@ class ICPEngine3D(BaseRegistrationEngine):
         valid_mask = np.array([len(c) >= 3 for c in counts], dtype=bool)
         return points[valid_mask]
 
-    def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.03, 
-                              angular_step_deg: float = 2.0) -> np.ndarray:
+    def weighted_voxel_fusion(self, tagged_points: list, voxel_size: float = 0.03) -> np.ndarray:
         """
-        FUSIONE ADATTIVA A SETTORI SFERICI 3D (SPHERICAL SECTOR AUTHORITY):
-        - Discretizza lo spazio 3D in spicchi sferici (Azimuth e Elevazione).
-        - Nella fascia centrale (pareti), assegna l'autorità alla stazione dominante nel settore.
-        - Nelle fasce esterne (soffitto e pavimento), mantiene la cooperazione tra stazioni.
-        - Compatta il volume finale con un Voxel Grid Filter isotropo a 3 cm.
+        FUSIONE 3D CALIBRATA SUL CONO OTTICO REALE (70° - 165°, Orizzonte 135°):
+        - Angoli fisici: Max Up = +65° (Zenith cone), Max Down = -30° (Nadir cone).
+        - Zona di visibilità standard (-30° <= elevazione <= +65°): Autorità esclusiva alla stazione
+          più vicina. Elimina muri doppi e ghosting.
+        - Coni d'ombra zenit/nadir: Se un punto cade nel cono cieco della stazione geometricamente più
+          vicina, viene accettato il dato rilevato da stazioni più distanti, sigillando pavimento e soffitto.
+        - Voxel Grid Filter finale: Compattazione isotropa a voxel_size metri.
         """
         if not tagged_points:
             return np.empty((0, 3), dtype=np.float32)
@@ -148,36 +149,38 @@ class ICPEngine3D(BaseRegistrationEngine):
         if num_stations == 1:
             return self.voxel_grid_filter(valid_stations[0][0], voxel_size)
 
-        # 1. Bounding box e fasce verticali su Z
-        all_pts_flat = np.vstack([pts for pts, _ in valid_stations])
-        z_min = float(np.min(all_pts_flat[:, 2]))
-        z_max = float(np.max(all_pts_flat[:, 2]))
-        h_tot = max(0.10, z_max - z_min)
-        z_low_thresh = z_min + (1.0 / 6.0) * h_tot
-        z_high_thresh = z_max - (1.0 / 6.0) * h_tot
-
-        # 2. k-d Tree dei centri per il calcolo della distanza minima assoluta
         all_centers = np.array([c for _, c in valid_stations], dtype=np.float32)
         centers_tree = cKDTree(all_centers)
+
+        # Limiti fisici di elevazione del sensore (in radianti)
+        max_elev_up_rad = np.deg2rad(65.0)     # 135° - 70°  = +65° (Soffitto/Zenith)
+        max_elev_down_rad = np.deg2rad(-30.0)  # 135° - 165° = -30° (Pavimento/Nadir)
 
         selected_clouds = []
         margin_m = 0.06
 
         for st_idx, (pts, center) in enumerate(valid_stations):
             rel_vecs = pts - center
-            dists = np.linalg.norm(rel_vecs, axis=1)
+            dists_3d = np.linalg.norm(rel_vecs, axis=1)
 
-            # Query sulle stazioni più vicine
+            # 1. Trova la stazione più vicina in assoluto per ciascun punto 3D
             closest_dists, nearest_st_ids = centers_tree.query(pts)
+            is_dominant = (dists_3d <= closest_dists + margin_m) | (nearest_st_ids == st_idx)
 
-            # A) Condizione di autorità sferica nella fascia centrale
-            is_dominant = (dists <= closest_dists + margin_m) | (nearest_st_ids == st_idx)
+            # 2. Calcola l'angolo di elevazione rispetto alla stazione più vicina
+            nearest_centers = all_centers[nearest_st_ids]
+            vec_to_nearest = pts - nearest_centers
+            dz_nearest = vec_to_nearest[:, 2]
+            dxy_nearest = np.hypot(vec_to_nearest[:, 0], vec_to_nearest[:, 1])
 
-            # B) Condizione cooperativa per soffitto e pavimento
-            is_roof_or_floor = (pts[:, 2] < z_low_thresh) | (pts[:, 2] > z_high_thresh)
+            # Elevazione angolare (in radianti) rispetto al piano orizzontale del sensore più vicino
+            elev_angle_nearest = np.arctan2(dz_nearest, np.maximum(0.01, dxy_nearest))
 
-            # Maschera finale
-            keep_mask = is_dominant | is_roof_or_floor
+            # Verifica se il punto ricade nel cono d'ombra ottico della stazione più vicina
+            in_nearest_blind_cone = (elev_angle_nearest > max_elev_up_rad) | (elev_angle_nearest < max_elev_down_rad)
+
+            # 3. Maschera combinata: mantieni se dominante oppure se serve a colmare un cono cieco altrui
+            keep_mask = is_dominant | in_nearest_blind_cone
             pts_kept = pts[keep_mask]
 
             if len(pts_kept) > 0:
@@ -188,10 +191,10 @@ class ICPEngine3D(BaseRegistrationEngine):
 
         stitched_volume = np.vstack(selected_clouds)
 
-        # 3. Compattazione Voxel Grid 3D
+        # 4. Compattazione volumetrica Voxel Grid 3D
         fused = self.voxel_grid_filter(stitched_volume, voxel_size=voxel_size)
 
-        # 4. Pulizia outlier
+        # 5. Pulizia dei residui isolati
         return self._smooth_slice_seams_3d(fused, radius=0.08)
 
     def voxel_grid_filter(self, points: np.ndarray, voxel_size: float = 0.03) -> np.ndarray:
