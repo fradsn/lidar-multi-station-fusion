@@ -30,7 +30,7 @@ Comparison showing the removal of parallel ghost walls through **Polar Sector De
 
 ### 3. 3D Volumetric Multi-Station Alignment & Fusion
 
-Full 3D volumetric workflow with 6-DoF cascade registration, **Spherical Sector Authority**, horizon-aware 3-band vertical partitioning, and OpenGL interactive rendering.
+Full 3D volumetric workflow with 6-DoF cascade registration, **Hardware-Calibrated Optical Cone Geometry**, zenith/nadir blind cone cooperation, and OpenGL interactive rendering.
 
 https://github.com/user-attachments/assets/a9956a8a-90a6-4aec-bc18-8eb90867c8ef
 
@@ -43,24 +43,24 @@ https://github.com/user-attachments/assets/a9956a8a-90a6-4aec-bc18-8eb90867c8ef
   - Robust iterative solver computing $(T_x, T_y, \text{Yaw } \theta)$.
   - Dynamic matching distance threshold decay (coarse $0.50\text{ m} \to$ fine $0.06\text{ m}$) ensuring rapid convergence and millimeter precision.
 - **Polar Sector Density Authority (Isotropic 360° Partitioning):**
-  - Discretizes each station's field of view into adaptive angular bins (polar sectors).
-  - Assigns geometric authority along each directional vector to the station with the highest sampling density and signal-to-noise ratio (closest proximity).
-  - Completely eliminates axis-orientation dependency: works seamlessly on oblique rooms, L-shaped corridors, and arbitrary sensor placements without wall clipping.
-- **Micro-Snap Neighbor Welding & 2D Voxel Grid Filter:**
-  - Regularizes boundary transitions with a $2\text{ cm}$ isotropic grid filter ($0.02\text{ m}$).
-  - Performs local $k\text{-d Tree}$ neighbor pruning to discard spurious airborne noise while enforcing continuous structural perimeters.
+  - Evaluates local spatial authority using a $k\text{-d Tree}$ of sensor coordinates, giving precedence to the station with the closest Euclidean proximity (highest sampling density and SNR).
+  - Groups validated points into 360 angular bins ($1^\circ$ resolution) along $\theta = \text{atan2}(\Delta y, \Delta x)$ to preserve wavefront continuity.
+  - Fully rotation-invariant and isotropic: eliminates wall-clipping and ghosting on oblique walls, L-shaped corridors, and arbitrary layouts.
+- **Micro-Snap Neighbor Pruning & 2D Voxel Grid Filter:**
+  - Regularizes boundary transitions with a $2\text{ cm}$ isotropic hash grid ($0.02\text{ m}$).
+  - Performs local $k\text{-d Tree}$ neighbor pruning ($r = 8\text{ cm}$) to discard airborne noise while ensuring continuous perimeter paths.
 
 ### 🧊 3D Volumetric Suite
 - **Full 6-DoF SVD Point-to-Point ICP:**
   - Closed-form Kabsch/SVD rototranslation solver across all degrees of freedom ($\text{Yaw } \theta_z, \text{Pitch } \theta_y, \text{Roll } \theta_x + T_x, T_y, T_z$).
   - **1-Click Global Auto-Align:** Cascaded registration of all imported 3D station scans against the accumulated spatial reference.
-- **Spherical Sector Authority & Dual-Ratio 3-Band Vertical Partitioning:**
-  - **Spherical Directional Binning:** Evaluates local authority along both horizontal azimuth ($\theta$) and vertical elevation ($\phi$) cones.
-  - **Central Band (2/3 of Total Height — Eye-Level/Horizon Walls):** *Strict exclusivity* for the dominant local station, eliminating double-wall ghosting and wall thickness inflation.
-  - **Upper & Lower Bands (1/6 each — Ceiling & Floor):** *Cooperative multi-station blending* to close zenith/nadir blind cones without clipping floor or ceiling surfaces.
+- **Hardware-Calibrated Optical Cone Authority & Blind Cone Healing:**
+  - **Exact Optical Field of View:** Calibrated to sensor limits ($70^\circ\text{--}165^\circ$ elevation range with horizon at $135^\circ$), defining an active vertical FoV of $[-30^\circ, +65^\circ]$.
+  - **Exclusive Wall Authority ($-30^\circ \le \phi \le +65^\circ$):** Strict authority granted to the nearest sensor to eliminate ghost walls and artificial thickness.
+  - **Zenith & Nadir Cooperative Healing ($\phi > +65^\circ$ or $\phi < -30^\circ$):** Automatically detects if a point falls within the blind cone of the closest station, seamlessly pulling complementary ceiling/floor data from farther stations to deliver watertight enclosures.
 - **Fast 3D Hash Grid & Spatial Outlier Pruning:**
-  - High-performance vector hashing for $3\text{ cm}$ cubic voxel centroid downsampling.
-  - Spherical $k\text{-d Tree}$ density validation to bridge boundary seams and eliminate isolated floating points.
+  - High-performance 64-bit vector hashing for $3\text{ cm}$ cubic voxel centroid downsampling.
+  - Spherical $k\text{-d Tree}$ neighbor validation ($r = 8\text{ cm}$) to prune isolated reflections and sensor artifacts.
 
 ### 🖥️ Universal Core & GUI
 - **Base Station Alignment Control:**
